@@ -1,0 +1,4 @@
+mlruns
+models
+torchviz_plots
+__pycache__
