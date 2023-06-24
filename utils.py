@@ -1,48 +1,65 @@
 from torchviz import make_dot
-import torch.nn.functional as F
-from torch.distributions.transforms import Transform
-from torch.distributions import constraints
-import math
+import os
 
-def do_torchviz_plots(loss, actor_net, critic_net, target_value, value_net, update_name):
-    make_dot(loss, params=dict(**dict(actor_net.named_parameters(prefix='actor')), 
-                                **dict(critic_net.named_parameters(prefix='critic')), 
-                                **dict(target_value.named_parameters(prefix='target_value')), 
-                                **dict(value_net.named_parameters(prefix='value'))), 
-                                show_attrs=True, show_saved=True).render('torchviz_plots/' + update_name, format="svg")
+class Logger():
+    def __init__(self, logger_name) -> None:
+        self.supported_loggers = ['wandb', 'mlflow']
+        self.logger_name = logger_name.lower()
+        if self.logger_name == 'none':
+            import warnings
+            warnings.warn(f'''Not using any loggers for current experiment! 
+                          Use --logger [logger_name] flag to use logger. 
+                          Supported loggers are {self.supported_loggers}\n''')
+        
+        else:
+            if self.logger_name not in self.supported_loggers:
+                raise ValueError('Only loggers supported are mlflow and wandb')
+            else:
+                self.logger = __import__(logger_name)
 
-class TanhTransform(Transform):
-    r"""
-    Transform via the mapping :math:`y = \tanh(x)`.
-    It is equivalent to
-    ```
-    ComposeTransform([AffineTransform(0., 2.), SigmoidTransform(), AffineTransform(-1., 2.)])
-    ```
-    However this might not be numerically stable, thus it is recommended to use `TanhTransform`
-    instead.
-    Note that one should use `cache_size=1` when it comes to `NaN/Inf` values.
-    """
-    domain = constraints.real
-    codomain = constraints.interval(-1.0, 1.0)
-    bijective = True
-    sign = +1
+        self.added_graphs = set()
 
-    @staticmethod
-    def atanh(x):
-        return 0.5 * (x.log1p() - (-x).log1p())
+    def init(self, exp_name, config):
+        self.exp_name = exp_name
+        if self.logger_name == 'none':
+            pass
+        elif self.logger_name == 'mlflow':
+            self.logger.set_experiment(self.exp_name)
+            self.logger.start_run()
+            self.logger.log_params(vars(config))
+        elif self.logger_name == 'wandb':
+            self.logger.init(project=self.exp_name, config=config)
 
-    def __eq__(self, other):
-        return isinstance(other, TanhTransform)
+    def log(self, data, step):
+        assert isinstance(data, dict), 'Only able to log metrics as a dict'
+        if self.logger_name == 'none':
+            pass
+        elif self.logger_name == 'mlflow':
+            self.logger.log_metrics(data, step)
+        elif self.logger_name == 'wandb':
+            self.logger.log(data, step)
 
-    def _call(self, x):
-        return x.tanh()
+    def end(self, status='FINISHED'):
+        if self.logger_name == 'none':
+            pass
+        elif self.logger_name == 'mlflow':
+            self.logger.end_run(status)
+        elif self.logger_name == 'wandb':
+            pass
 
-    def _inverse(self, y):
-        # We do not clamp to the boundary here as it may degrade the performance of certain algorithms.
-        # one should use `cache_size=1` instead
-        return self.atanh(y)
+    def do_torchviz_plots(self, loss, params, update_name):
+        if update_name not in self.added_graphs:
+            self.added_graphs.add(update_name)
+            os.makedirs(f'torchviz_plots/{self.exp_name}/', exist_ok=True)
+            make_dot(loss, params=params, show_attrs=True, 
+                show_saved=True).render(f'torchviz_plots/{self.exp_name}/' + update_name, format="png")
+            if self.logger_name == 'wandb':
+                self.logger.log({update_name: self.logger.Image(f'torchviz_plots/{self.exp_name}/{update_name}.png')})
+            else:
+                pass
 
-    def log_abs_det_jacobian(self, x, y):
-        # We use a formula that is more numerically stable, see details in the following link
-        # https://github.com/tensorflow/probability/blob/master/tensorflow_probability/python/bijectors/tanh.py#L69-L80
-        return 2. * (math.log(2.) - x - F.softplus(-2. * x))
+    
+def set_seed(env, seed):
+    env.reset(seed=seed)
+    env.action_space.seed(seed)
+    env.observation_space.seed(seed)

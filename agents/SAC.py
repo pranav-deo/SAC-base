@@ -1,14 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import TransformedDistribution
 
 from ReplayBuffer import ReplayBuffer
 import copy
 import numpy as np
-from mlflow import log_metric
 import tqdm
-from utils import do_torchviz_plots, TanhTransform
 
 
 class BaseNetwork(nn.Module):
@@ -42,9 +39,7 @@ class ActorNetwork(nn.Module):
         log_std = torch.clamp(log_std, -20, 2)
         std = log_std.exp()
         dist = torch.distributions.Normal(mean, std)
-        transforms = [TanhTransform(cache_size=1)]
-        dist = TransformedDistribution(dist, transforms)
-        return dist, torch.tanh(mean)
+        return dist, mean
 
 
 class DoubleCriticNetwork(nn.Module):
@@ -64,10 +59,11 @@ class ValueNetwork(BaseNetwork):
 
 
 class SAC:
-    def __init__(self, env, eval_env, args):
+    def __init__(self, env, eval_env, args, logger):
 
         obs_dim = env.observation_space.shape[0]
         act_dim = env.action_space.shape[0]
+        self.max_action = env.action_space.high[0]
 
         self.device = torch.device(
             'cuda' if torch.cuda.is_available() else 'cpu')
@@ -86,31 +82,38 @@ class SAC:
             self.critic_net.parameters(), lr=args.lr_critic)
         self.value_optim = torch.optim.Adam(
             self.value_net.parameters(), lr=args.lr_value)
+        
+        if args.plot_computational_graph:
+            self.all_params = dict(**dict(self.actor_net.named_parameters(prefix='actor')), 
+                                    **dict(self.critic_net.named_parameters(prefix='critic')), 
+                                    **dict(self.target_value.named_parameters(prefix='target_value')), 
+                                    **dict(self.value_net.named_parameters(prefix='value')))
 
         self.env = env
         self.eval_env = eval_env
         self.args = args
+        self.logger = logger
 
     def select_action(self, obs, stochastic=True, with_log_prob=False):
         if not isinstance(obs, torch.Tensor):
             obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
         dist, mean = self.actor_net(obs)
+        act = dist.rsample() if stochastic else mean
+        scaled_act = torch.tanh(act) * self.max_action
         if with_log_prob:
-            act = dist.rsample() if stochastic else mean
-            return act, torch.sum(dist.log_prob(act), dim=-1, keepdim=True)
-        else:
-            act = dist.rsample() if stochastic else mean
-            return act
+            log_prob = torch.sum(dist.log_prob(act), dim=-1, keepdim=True)
+            log_prob -= torch.sum((2*(np.log(2) - act - F.softplus(-2*act))),dim=1, keepdim=True)
+            return scaled_act, log_prob
+        return scaled_act
+
 
     def update_actor(self, obs):
         act, log_prob = self.select_action(obs, with_log_prob=True)
-        with torch.no_grad():
-            q_min = torch.minimum(*self.critic_net(obs, act))
+        q_min = torch.minimum(*self.critic_net(obs, act))
         loss = (self.args.alpha*log_prob - q_min).mean()
 
         if self.args.plot_computational_graph:
-            do_torchviz_plots(loss, self.actor_net, self.critic_net,
-                              self.target_value, self.value_net, 'actor_update')
+            self.logger.do_torchviz_plots(loss, self.all_params, 'net/actor_update')
 
         self.actor_optim.zero_grad()
         loss.backward()
@@ -118,16 +121,16 @@ class SAC:
         return loss
 
     def update_value(self, obs):
-        value = self.value_net(obs)
         with torch.no_grad():
-            act, log_prob = self.select_action(obs, with_log_prob=True)
+            act, log_prob = self.select_action(obs, with_log_prob=True, stochastic=False)
             q_min = torch.minimum(*self.critic_net(obs, act))
             target_v = q_min - self.args.alpha * log_prob
+
+        value = self.value_net(obs)
         loss = F.mse_loss(value, target_v).mean()
 
         if self.args.plot_computational_graph:
-            do_torchviz_plots(loss, self.actor_net, self.critic_net,
-                              self.target_value, self.value_net, 'value_update')
+            self.logger.do_torchviz_plots(loss, self.all_params, 'net/value_update')
 
         self.value_optim.zero_grad()
         loss.backward()
@@ -143,8 +146,7 @@ class SAC:
         loss = (F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)).mean()
 
         if self.args.plot_computational_graph:
-            do_torchviz_plots(loss, self.actor_net, self.critic_net,
-                              self.target_value, self.value_net, 'critic_update')
+            self.logger.do_torchviz_plots(loss, self.all_params, 'net/critic_update')
 
         self.critic_optim.zero_grad()
         loss.backward()
@@ -173,7 +175,7 @@ class SAC:
                 not_done = 1.0 - terminated
                 self.buffer.add_step(obs, next_obs, act, rew, not_done)
                 if (terminated or truncated):
-                    log_metric('train_reward', ep_rew, step)
+                    self.logger.log({'train/train_reward': ep_rew}, step)
                     next_obs, _ = self.env.reset()
                     ep_rew = 0
                 obs = next_obs
@@ -188,17 +190,16 @@ class SAC:
                             actor_loss = self.update_actor(b_obs)
                             self.soft_update()
 
-                    log_metric('value', val, step)
-                    log_metric('log_prob', log_prob, step)
-                    log_metric('q1', q[0], step)
-                    log_metric('q2', q[1], step)
-                    log_metric('value_loss', value_loss.item(), step)
-                    log_metric('critic_loss', critic_loss.item(), step)
-                    log_metric('actor_loss', actor_loss.item(), step)
+                        metrics_to_log = {'net/value': val, 'train/log_prob': log_prob,
+                                         'net/q1': q[0], 'net/q2': q[1],
+                                         'loss/value_loss': value_loss.item(), 
+                                         'loss/critic_loss': critic_loss.item(),
+                                         'loss/actor_loss': actor_loss.item()}
+                        self.logger.log(metrics_to_log, step)
 
                 if step % self.args.eval_interval == 0:
                     eval_rew = self.eval()
-                    log_metric('eval_reward', eval_rew, step)
+                    self.logger.log({'eval/eval_reward': eval_rew}, step)
                 step += 1
                 pbar.update(1)
 

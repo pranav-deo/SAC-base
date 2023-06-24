@@ -6,9 +6,7 @@ from torch.distributions import Normal
 from ReplayBuffer import ReplayBuffer
 import copy
 import numpy as np
-from mlflow import log_metric
 import tqdm
-# from utils import do_torchviz_plots
 
 class BaseNetwork(nn.Module):
     def __init__(self, input, output, hidden_dim=256) -> None:
@@ -46,7 +44,7 @@ class DoubleCriticNetwork(nn.Module):
 
 
 class TD3:
-    def __init__(self, env, eval_env, args):
+    def __init__(self, env, eval_env, args, logger):
 
         obs_dim = env.observation_space.shape[0]
         act_dim = env.action_space.shape[0]
@@ -73,9 +71,16 @@ class TD3:
         self.critic_optim = torch.optim.Adam(
             self.critic_net.parameters(), lr=args.lr_critic)
 
+        if args.plot_computational_graph:
+            self.all_params = dict(**dict(self.actor_net.named_parameters(prefix='actor')), 
+                                    **dict(self.critic_net.named_parameters(prefix='critic')), 
+                                    **dict(self.target_actor.named_parameters(prefix='target_actor')), 
+                                    **dict(self.target_critic.named_parameters(prefix='target_critic')))
+
         self.env = env
         self.eval_env = eval_env
         self.args = args
+        self.logger = logger
 
     def select_action(self, obs, stochastic=True, 
                       do_clip_noise=False, target_actor=False):
@@ -92,13 +97,11 @@ class TD3:
 
     def update_actor(self, obs):
         act = self.select_action(obs, stochastic=False)
-        # with torch.no_grad():
         q_1 = self.critic_net(obs, act)[0]
         loss = -q_1.mean()
 
-        # if self.args.plot_computational_graph:
-        #     do_torchviz_plots(loss, self.actor_net, self.critic_net,
-        #                       self.target_value, self.value_net, 'actor_update')
+        if self.args.plot_computational_graph:
+            self.logger.do_torchviz_plots(loss, self.all_params, 'net/actor_update')
 
         self.actor_optim.zero_grad()
         loss.backward()
@@ -116,9 +119,8 @@ class TD3:
 
         loss = (F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)).mean()
 
-        # if self.args.plot_computational_graph:
-        #     do_torchviz_plots(loss, self.actor_net, self.critic_net,
-        #                       self.target_value, self.value_net, 'critic_update')
+        if self.args.plot_computational_graph:
+            self.logger.do_torchviz_plots(loss, self.all_params, 'net/critic_update')
 
         self.critic_optim.zero_grad()
         loss.backward()
@@ -152,7 +154,7 @@ class TD3:
                 not_done = 1.0 - terminated
                 self.buffer.add_step(obs, next_obs, act, rew, not_done)
                 if (terminated or truncated):
-                    log_metric('train_reward', ep_rew, step)
+                    self.logger.log({'train/train_reward': ep_rew}, step)
                     next_obs, _ = self.env.reset()
                     ep_rew = 0
                 obs = next_obs
@@ -163,15 +165,16 @@ class TD3:
                     if step % self.args.update_actor_freq == 0:
                         actor_loss = self.update_actor(b_obs)
                         self.soft_update()
-                        log_metric('actor_loss', actor_loss.item(), step)
+                        self.logger.log({'loss/actor_loss': actor_loss.item()}, step)
 
-                    log_metric('q1', q[0], step)
-                    log_metric('q2', q[1], step)
-                    log_metric('critic_loss', critic_loss.item(), step)
+                    metrics_to_log = {'net/q1': q[0], 'net/q2': q[1],
+                                     'loss/critic_loss': critic_loss.item()}
+                    self.logger.log(metrics_to_log, step)
+
 
                 if step % self.args.eval_interval == 0:
                     eval_rew = self.eval()
-                    log_metric('eval_reward', eval_rew, step)
+                    self.logger.log({'eval/eval_reward': eval_rew}, step)
                 step += 1
                 pbar.update(1)
 
@@ -183,7 +186,6 @@ class TD3:
             while not done:
                 act = self.select_action(obs, stochastic=False, 
                                          target_actor=True).cpu().detach().numpy()
-                # act = np.clip(act, -self.max_action, self.max_action)
                 next_obs, rew, terminated, truncated, done = self.eval_env.step(act)
                 ep_reward += rew
                 done = terminated or truncated
